@@ -1,0 +1,128 @@
+ESP32 (Arduino) — publish GPS + alert over MQTT
+
+What it does: connects to Wi-Fi, reads GPS from a Neo-6M (Serial1) using TinyGPS++. When you press a button (or when speed/condition triggers), it publishes a JSON message to topic emergency/alerts.
+
+
+
+
+
+
+
+
+
+
+
+// ESP32_MQTT_GPS.ino
+#include <WiFi.h>
+#include <PubSubClient.h>
+#include <TinyGPS++.h>
+
+// --------- CONFIG ----------
+const char* ssid = "YOUR_WIFI_SSID";
+const char* password = "YOUR_WIFI_PASS";
+const char* mqtt_server = "test.mosquitto.org";
+const int mqtt_port = 1883;
+const char* mqtt_topic = "emergency/alerts";
+// ---------------------------
+
+WiFiClient espClient;
+PubSubClient client(espClient);
+
+TinyGPSPlus gps;
+
+// For Neo-6M (hardware Serial1 on ESP32)
+#define GPS_RX_PIN 16 // ESP32 RX for GPS TX
+#define GPS_TX_PIN 17 // ESP32 TX for GPS RX (not used here)
+HardwareSerial GPSSerial(1);
+
+// optional: a physical button to send an alert
+#define BUTTON_PIN 0
+
+unsigned long lastPublish = 0;
+const unsigned long publishInterval = 10000; // 10s periodic publish when we have fix
+
+void setup() {
+  Serial.begin(115200);
+  GPSSerial.begin(9600, SERIAL_8N1, GPS_RX_PIN, GPS_TX_PIN); // rx, tx pins
+  pinMode(BUTTON_PIN, INPUT_PULLUP);
+
+  WiFi.begin(ssid, password);
+  Serial.print("Connecting WiFi");
+  while (WiFi.status() != WL_CONNECTED) {
+    delay(300);
+    Serial.print(".");
+  }
+  Serial.println("\nWiFi connected.");
+
+  client.setServer(mqtt_server, mqtt_port);
+
+  // connect MQTT
+  reconnectMQTT();
+}
+
+void reconnectMQTT() {
+  while (!client.connected()) {
+    Serial.print("Connecting MQTT...");
+    if (client.connect("ESP32_Client")) {
+      Serial.println("connected.");
+    } else {
+      Serial.print("failed, rc=");
+      Serial.print(client.state());
+      Serial.println(" try again in 2s");
+      delay(2000);
+    }
+  }
+}
+
+void loop() {
+  // MQTT loop
+  if (!client.connected()) {
+    reconnectMQTT();
+  }
+  client.loop();
+
+  // read GPS bytes
+  while (GPSSerial.available() > 0) {
+    gps.encode(GPSSerial.read());
+  }
+
+  // If physical button pressed -> send alert
+  if (digitalRead(BUTTON_PIN) == LOW) {
+    sendAlert("Manual Alert: button pressed");
+    delay(500); // debounce
+  }
+
+  // Optionally publish periodic GPS if have fix
+  if (gps.location.isValid() && millis() - lastPublish > publishInterval) {
+    lastPublish = millis();
+    // Example simple heartbeat with location
+    String payload = buildJsonPayload("Periodic Location", gps.location.lat(), gps.location.lng(), gps.speed.kmph());
+    client.publish(mqtt_topic, payload.c_str());
+    Serial.println("Published: " + payload);
+  }
+
+  // Example: if too slow or no GPS, you might send a simulated alert - remove in production
+  // (not necessary unless for testing)
+}
+
+String buildJsonPayload(const char* message, double lat, double lon, double speedKmph) {
+  // Build a simple JSON string
+  char buf[256];
+  snprintf(buf, sizeof(buf),
+           "{\"device\":\"ESP32_01\",\"message\":\"%s\",\"lat\":%.6f,\"lon\":%.6f,\"speed\":%.2f,\"ts\":%lu}",
+           message, lat, lon, speedKmph, millis());
+  return String(buf);
+}
+
+void sendAlert(const char* message) {
+  if (!gps.location.isValid()) {
+    // if GPS invalid, send a "no-gps" alert with 0,0 (or you could skip and send local IP instead)
+    String payload = buildJsonPayload(message, 0.0, 0.0, 0.0);
+    client.publish(mqtt_topic, payload.c_str());
+    Serial.println("Published (no GPS): " + payload);
+  } else {
+    String payload = buildJsonPayload(message, gps.location.lat(), gps.location.lng(), gps.speed.kmph());
+    client.publish(mqtt_topic, payload.c_str());
+    Serial.println("Published: " + payload);
+  }
+}

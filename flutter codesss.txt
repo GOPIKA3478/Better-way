@@ -1,0 +1,262 @@
+### Flutter app — subscribe to MQTT, show alerts, map + notification
+
+dependencies:
+  flutter:
+    sdk: flutter
+  mqtt_client: ^9.0.5
+  flutter_map: ^4.2.0
+  latlong2: ^0.9.0
+  cupertino_icons: ^1.0.2
+  # optional: for local notifications
+  flutter_local_notifications: ^13.0.0
+
+
+import 'dart:convert';
+import 'package:flutter/material.dart';
+import 'package:mqtt_client/mqtt_client.dart' as mqtt;
+import 'package:mqtt_client/mqtt_server_client.dart';
+import 'package:flutter_map/flutter_map.dart';
+import 'package:latlong2/latlong.dart';
+
+void main() {
+  runApp(const SmartEmergencyFlutterApp());
+}
+
+class SmartEmergencyFlutterApp extends StatelessWidget {
+  const SmartEmergencyFlutterApp({super.key});
+
+  @override
+  Widget build(BuildContext context) {
+    return MaterialApp(
+      title: 'IoT Emergency Monitor',
+      theme: ThemeData(primarySwatch: Colors.red),
+      home: const MqttHomePage(),
+    );
+  }
+}
+
+class AlertItem {
+  final String device;
+  final String message;
+  final double lat;
+  final double lon;
+  final double speed;
+  final int ts;
+
+  AlertItem({
+    required this.device,
+    required this.message,
+    required this.lat,
+    required this.lon,
+    required this.speed,
+    required this.ts,
+  });
+
+  factory AlertItem.fromJson(Map<String, dynamic> j) {
+    return AlertItem(
+      device: j['device'] ?? 'unknown',
+      message: j['message'] ?? '',
+      lat: (j['lat'] ?? 0.0).toDouble(),
+      lon: (j['lon'] ?? 0.0).toDouble(),
+      speed: (j['speed'] ?? 0.0).toDouble(),
+      ts: (j['ts'] ?? 0).toInt(),
+    );
+  }
+}
+
+class MqttHomePage extends StatefulWidget {
+  const MqttHomePage({super.key});
+
+  @override
+  State<MqttHomePage> createState() => _MqttHomePageState();
+}
+
+class _MqttHomePageState extends State<MqttHomePage> {
+  final client = MqttServerClient('test.mosquitto.org', 'flutter_client_${DateTime.now().millisecondsSinceEpoch}');
+  final List<AlertItem> alerts = [];
+  bool connected = false;
+
+  // Map controller & marker
+  final mapController = MapController();
+  LatLng? latestLocation;
+
+  @override
+  void initState() {
+    super.initState();
+    setupMqtt();
+  }
+
+  Future<void> setupMqtt() async {
+    client.logging(on: false);
+    client.keepAlivePeriod = 20;
+    client.onDisconnected = onDisconnected;
+    client.onConnected = onConnected;
+    client.onSubscribed = onSubscribed;
+
+    final connMess = mqtt.MqttConnectMessage()
+        .withClientIdentifier(client.clientIdentifier!)
+        .startClean()
+        .withWillQos(mqtt.MqttQos.atLeastOnce);
+    client.connectionMessage = connMess;
+
+    try {
+      await client.connect();
+    } catch (e) {
+      debugPrint('MQTT client connection failed - $e');
+      client.disconnect();
+    }
+
+    if (client.connectionStatus?.state == mqtt.MqttConnectionState.connected) {
+      setState(() => connected = true);
+      client.subscribe('emergency/alerts', mqtt.MqttQos.atLeastOnce);
+      client.updates!.listen(onMessage);
+    } else {
+      debugPrint('MQTT not connected, status: ${client.connectionStatus}');
+    }
+  }
+
+  void onConnected() {
+    debugPrint('Connected to MQTT broker.');
+    setState(() {
+      connected = true;
+    });
+  }
+
+  void onDisconnected() {
+    debugPrint('Disconnected from MQTT broker.');
+    setState(() {
+      connected = false;
+    });
+  }
+
+  void onSubscribed(String topic) {
+    debugPrint('Subscribed to $topic');
+  }
+
+  void onMessage(List<mqtt.MqttReceivedMessage<mqtt.MqttMessage?>>? event) {
+    final recMess = event![0].payload as mqtt.MqttPublishMessage;
+    final payload =
+        mqtt.MqttPublishPayload.bytesToStringAsString(recMess.payload.message);
+
+    debugPrint('Received: $payload');
+    try {
+      final data = json.decode(payload);
+      final alert = AlertItem.fromJson(data);
+      setState(() {
+        alerts.insert(0, alert);
+        if (alert.lat != 0.0 || alert.lon != 0.0) {
+          latestLocation = LatLng(alert.lat, alert.lon);
+          // move map
+          mapController.move(latestLocation!, 15.0);
+        }
+      });
+      // Show a snackbar/notification
+      ScaffoldMessenger.of(context).showSnackBar(
+        SnackBar(content: Text('Alert: ${alert.message} from ${alert.device}')),
+      );
+    } catch (e) {
+      debugPrint('Error parsing MQTT message: $e');
+    }
+  }
+
+  @override
+  void dispose() {
+    client.disconnect();
+    super.dispose();
+  }
+
+  Widget buildMap() {
+    final center = latestLocation ?? LatLng(20.5937, 78.9629); // India center fallback
+    return FlutterMap(
+      mapController: mapController,
+      options: MapOptions(center: center, zoom: 5.0, maxZoom: 18.0),
+      children: [
+        TileLayer(
+          urlTemplate: "https://{s}.tile.openstreetmap.org/{z}/{x}/{y}.png",
+          subdomains: const ['a', 'b', 'c'],
+        ),
+        if (latestLocation != null)
+          MarkerLayer(
+            markers: [
+              Marker(
+                point: latestLocation!,
+                width: 80,
+                height: 80,
+                builder: (ctx) => const Icon(Icons.location_on, size: 40),
+              ),
+            ],
+          ),
+      ],
+    );
+  }
+
+  @override
+  Widget build(BuildContext context) {
+    return Scaffold(
+      appBar: AppBar(
+        title: const Text('IoT Emergency Monitor'),
+        actions: [
+          Padding(
+            padding: const EdgeInsets.all(12.0),
+            child: connected ? const Icon(Icons.wifi, color: Colors.green) : const Icon(Icons.wifi_off, color: Colors.grey),
+          )
+        ],
+      ),
+      body: Column(
+        children: [
+          SizedBox(height: 240, child: buildMap()),
+          Container(
+            color: Colors.grey[200],
+            width: double.infinity,
+            padding: const EdgeInsets.all(8),
+            child: Text(
+              'Latest Alerts (${alerts.length})',
+              style: const TextStyle(fontWeight: FontWeight.bold),
+            ),
+          ),
+          Expanded(
+            child: ListView.builder(
+              itemCount: alerts.length,
+              itemBuilder: (c, i) {
+                final a = alerts[i];
+                return ListTile(
+                  leading: const Icon(Icons.report_problem, color: Colors.red),
+                  title: Text(a.message),
+                  subtitle: Text('${a.device} • ${a.lat.toStringAsFixed(5)}, ${a.lon.toStringAsFixed(5)} • speed ${a.speed} km/h'),
+                  trailing: Text('${a.ts}'),
+                  onTap: () {
+                    if (a.lat != 0.0 || a.lon != 0.0) {
+                      mapController.move(LatLng(a.lat, a.lon), 16.0);
+                      setState(() => latestLocation = LatLng(a.lat, a.lon));
+                    } else {
+                      ScaffoldMessenger.of(context).showSnackBar(const SnackBar(content: Text('No GPS for this alert')));
+                    }
+                  },
+                );
+              },
+            ),
+          ),
+        ],
+      ),
+    );
+  }
+}
+
+
+<!-- internet permission -->
+<uses-permission android:name="android.permission.INTERNET"/>
+
+
+mosquitto_pub -h test.mosquitto.org -t "emergency/alerts" -m '{"device":"test","message":"Test Alert","lat":12.9716,"lon":77.5946,"speed":0.0,"ts":123456789}'
+
+
+{
+  "device": "ESP32_01",
+  "message": "Manual Alert: button pressed",
+  "lat": 12.9715987,
+  "lon": 77.5945627,
+  "speed": 0.0,
+  "ts": 123456789
+}
+
+
